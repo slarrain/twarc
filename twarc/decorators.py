@@ -1,6 +1,9 @@
 import time
 import logging
 import requests
+import configparser
+from itertools import cycle
+
 
 log = logging.getLogger('twarc')
 
@@ -12,6 +15,21 @@ def rate_limit(f):
     issue the API call again.
     """
     def new_f(*args, **kwargs):
+        # The twarc instance
+        self = args[0]
+
+        # Get the credentials
+        config = configparser.ConfigParser()
+        config.read(self.config)
+        useraccounts = config.sections()
+
+        # Create the neverending pool or carousel
+        pool = cycle(useraccounts)
+
+        # If it was note set, then it is the first
+        if self.profile == '':
+            self.profile = next(pool)
+        rate_limit_dict = dict.fromkeys(useraccounts, 0)
         errors = 0
         while True:
             resp = f(*args, **kwargs)
@@ -31,14 +49,42 @@ def rate_limit(f):
                     e.args = (e.args[0] + message,) + e.args[1:]
                     log.warning("401 Authentication required for %s", resp.url)
                     raise
+
+            # Situation where we hit the rate limit
             elif resp.status_code == 429:
                 reset = int(resp.headers['x-rate-limit-reset'])
-                now = time.time()
-                seconds = reset - now + 10
-                if seconds < 1:
-                    seconds = 10
-                log.warning("rate limit exceeded: sleeping %s secs", seconds)
-                time.sleep(seconds)
+
+                # What time is this profile going to be available again?
+                rate_limit_dict[self.profile] = reset
+
+                minimo = min(rate_limit_dict.values())
+                
+                if (minimo > 0):  # If one minimo is 0, then we have more to go
+                    now = time.time()
+                    seconds = minimo - now + 10
+                    if seconds < 1:
+                        seconds = 10
+                    log.info(rate_limit_dict)  # Debugging
+
+                    #Make the profile the one that has the shortest wait registred
+                    self.profile = min(rate_limit_dict, key=lambda k:rate_limit_dict[k])
+                    log.warning("Sleeping on {}".format(self.profile))
+                    log.warning("rate limit exceeded: sleeping %s secs", seconds)
+                    time.sleep(seconds)
+
+                    # Reset the rate limit dictionary, since there was a wait 
+                    # even though not all of them are going to be zero.
+                    # But we'll be able to update the rate limit time
+                    rate_limit_dict = dict.fromkeys(useraccounts, 0)
+
+                else:
+                    self.profile = next(pool)  # Go to the next profile
+                    log.warning("Using {} credentials".format(self.profile))
+                # Update the Twarc instance with the new profile. This should happen 
+                # if there is a wait and if there isn't
+                self.load_config()
+                self.connect()
+
             elif resp.status_code >= 500:
                 errors += 1
                 if errors > 30:
