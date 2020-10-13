@@ -6,6 +6,7 @@ import sys
 import json
 import types
 import logging
+import datetime
 import requests
 
 import ssl
@@ -13,8 +14,8 @@ from requests.exceptions import ConnectionError
 from requests.packages.urllib3.exceptions import ProtocolError
 
 from .decorators import *
-from requests_oauthlib import OAuth1, OAuth1Session
-
+from requests_oauthlib import OAuth1, OAuth1Session, OAuth2Session
+from oauthlib.oauth2 import BackendApplicationClient
 
 if sys.version_info[:2] <= (2, 7):
     # Python 2
@@ -44,7 +45,7 @@ class Twarc(object):
                  access_token=None, access_token_secret=None,
                  connection_errors=0, http_errors=0, config=None,
                  profile="", protected=False, tweet_mode="extended",
-                 validate_keys=True):
+                 app_auth=False, validate_keys=True):
         """
         Instantiate a Twarc instance. If keys aren't set we'll try to
         discover them in the environment or a supplied profile. If no
@@ -63,6 +64,7 @@ class Twarc(object):
         self.last_response = None
         self.tweet_mode = tweet_mode
         self.protected = protected
+        self.app_auth = app_auth
 
         if config:
             self.config = config
@@ -78,39 +80,44 @@ class Twarc(object):
     def search(self, q, max_id=None, since_id=None, lang=None,
                result_type='recent', geocode=None, max_pages=None):
         """
-        Pass in a query with optional max_id, min_id, lang or geocode
-        and get back an iterator for decoded tweets. Defaults to recent (i.e.
-        not mixed, the API default, or popular) tweets.
+        Pass in a query with optional max_id, min_id, lang, geocode, or
+        max_pages, and get back an iterator for decoded tweets. Defaults to
+        recent (i.e. not mixed, the API default, or popular) tweets.
         """
         url = "https://api.twitter.com/1.1/search/tweets.json"
         params = {
             "count": 100,
             "q": q,
-            "include_ext_alt_text": 'true'
+            "include_ext_alt_text": 'true',
+            "include_entities": "true"
         }
+
         if lang is not None:
             params['lang'] = lang
+        if geocode is not None:
+            params['geocode'] = geocode
+        if since_id:
+            # Make the since_id inclusive, so we can avoid retrieving
+            # an empty page of results in some cases
+            params['since_id'] = str(int(since_id) - 1)
+
         if result_type in ['mixed', 'recent', 'popular']:
             params['result_type'] = result_type
         else:
             params['result_type'] = 'recent'
-        if geocode is not None:
-            params['geocode'] = geocode
 
         retrieved_pages = 0
         reached_end = False
 
         while True:
-            if since_id:
-                # Make the since_id inclusive, so we can avoid retrieving
-                # an empty page of results in some cases
-                params['since_id'] = str(int(since_id) - 1)
+
+            # note: max_id changes as results are retrieved
             if max_id:
                 params['max_id'] = max_id
 
             resp = self.get(url, params=params)
-            retrieved_pages += 1
 
+            retrieved_pages += 1
             statuses = resp.json()["statuses"]
 
             if len(statuses) == 0:
@@ -134,6 +141,71 @@ class Twarc(object):
                 break
 
             max_id = str(int(status["id_str"]) - 1)
+
+    def premium_search(self, q, product, environment, from_date=None,
+            to_date=None, max_results=None, sandbox=False, limit=0):
+        """
+        Search using the Premium Search API. You will need to pass in a query
+        a product (30day or fullarchive) and and environment to use. Optionally
+        you can pass in a from_date and to_date to limit the search using
+        datetime objects. If you would like to set max_results you can, or
+        you can accept the maximum results (500). If using the a sandbox 
+        environment you will want to set sandbox=True to lower the max_results
+        to 100. The limit option will cause your search to finish after it has 
+        return more than that number of tweets (0 means no limit).
+        """
+
+        if not self.app_auth:
+            raise RuntimeError(
+                "This endpoint is only available with application authentication. "
+                "Pass app_auth=True in Python or --app-auth on the command line."
+            )
+
+        if from_date and not isinstance(from_date, datetime.date):
+            raise RuntimeError("from_date must be a datetime.date or datetime.datetime object")
+        if to_date and not isinstance(to_date, datetime.date):
+            raise RuntimeError("to_date must be a datetime.date or datetime.datetime object")
+
+        if product not in ['30day', 'fullarchive']:
+            raise RuntimeError(
+                'Invalid Premium Search API product: {}'.format(product)
+            )
+
+        # set default max_results based on whether its sandboxed
+        if max_results is None:
+            if sandbox:
+                max_results = 100
+            else:
+                max_results = 500
+
+        url = 'https://api.twitter.com/1.1/tweets/search/{}/{}.json'.format(
+            product, 
+            environment
+        )
+
+        params = {
+            "query": q,
+            "fromDate": from_date.strftime('%Y%m%d%H%M') if from_date else None,
+            "toDate": to_date.strftime('%Y%m%d%H%M') if to_date else None,
+            "maxResults": max_results
+        }
+    
+        count = 0
+        stop = False
+        while not stop:
+            resp = self.get(url, params=params)
+            if resp.status_code == 200:
+                data = resp.json()
+                for tweet in data['results']:
+                    count += 1
+                    yield tweet
+                    if limit != 0 and count >= limit:
+                        stop = True
+                        break
+                if 'next' in data:
+                    params['next'] = data['next']
+                else:
+                    stop = True
 
     def timeline(self, user_id=None, screen_name=None, max_id=None,
                  since_id=None, max_pages=None):
@@ -279,7 +351,7 @@ class Twarc(object):
             for user_id in user_ids['ids']:
                 yield str_type(user_id)
             params['cursor'] = user_ids['next_cursor']
-            
+
             if max_pages is not None and retrieved_pages == max_pages:
                 log.info("reached max follower page limit for %s", params)
                 break
@@ -299,7 +371,7 @@ class Twarc(object):
             params = {'screen_name': user, 'cursor': -1}
 
         retrieved_pages = 0
-        
+
         while params['cursor'] != 0:
             try:
                 resp = self.get(url, params=params, allow_404=True)
@@ -319,7 +391,7 @@ class Twarc(object):
                 break
 
     @filter_protected
-    def filter(self, track=None, follow=None, locations=None, lang=[], 
+    def filter(self, track=None, follow=None, locations=None, lang=[],
                event=None, record_keepalive=False):
         """
         Returns an iterator for tweets that match a given filter track from
@@ -455,6 +527,79 @@ class Twarc(object):
                     log.info("stopping filter")
                     return
 
+    def labs_v1_sample(self, event=None, record_keepalive=False):
+        """
+        Returns a small random sample of all public statuses, using the new Twitter
+        labs API version of the endpoint.
+
+        The Tweets returned by the default access level are the same, so if two
+        different clients connect to this endpoint, they will see the same Tweets.
+
+        If a threading.Event is provided for event and the event is set,
+        the sample will be interrupted.
+
+        Requires the use of application only authorisation (set app_auth=True on
+        constructing the Twarc client, or on the commandline).
+        """
+
+        if not self.app_auth:
+            raise RuntimeError(
+                "This endpoint is only available with application authentication. "
+                "Pass app_auth=True in Python or --app-auth on the command line."
+            )
+
+        url = 'https://api.twitter.com/labs/1/tweets/stream/sample'
+        headers = {'accept-encoding': 'deflate, gzip'}
+        errors = 0
+        while True:
+            try:
+                log.info("connecting to labs sample stream")
+                resp = self.get(url, headers=headers, stream=True)
+                errors = 0
+                for raw_line in resp.iter_lines(chunk_size=512):
+                    line = raw_line.decode()
+                    if event and event.is_set():
+                        log.info("stopping sample")
+                        # Explicitly close response
+                        resp.close()
+                        return
+                    if line == "":
+                        log.info("keep-alive")
+                        if record_keepalive:
+                            yield "keep-alive"
+                        continue
+                    try:
+                        yield json.loads(line)
+                    except Exception as e:
+                        log.error("json parse error: %s - %s", e, line)
+            except requests.exceptions.HTTPError as e:
+                errors += 1
+                log.error("caught http error %s on %s try", e, errors)
+                if self.http_errors and errors == self.http_errors:
+                    log.warning("too many errors")
+                    raise e
+                if e.response_status_code == 403:
+                    log.warning("access denied for app (403 Error)")
+                    raise e
+                if e.response.status_code == 420:
+                    if interruptible_sleep(errors * 60, event):
+                        log.info("stopping filter")
+                        return
+                else:
+                    if interruptible_sleep(errors * 5, event):
+                        log.info("stopping filter")
+                        return
+
+            except Exception as e:
+                errors += 1
+                log.error("caught exception %s on %s try", e, errors)
+                if self.http_errors and errors == self.http_errors:
+                    log.warning("too many errors")
+                    raise e
+                if interruptible_sleep(errors, event):
+                    log.info("stopping filter")
+                    return
+
     def dehydrate(self, iterator):
         """
         Pass in an iterator of tweets' JSON and get back an iterator of the
@@ -466,7 +611,7 @@ class Twarc(object):
             except Exception as e:
                 log.error("uhoh: %s\n" % e)
 
-    def hydrate(self, iterator):
+    def hydrate(self, iterator, trim_user=False):
         """
         Pass in an iterator of tweet ids and get back an iterator for the
         decoded JSON for each corresponding tweet.
@@ -483,7 +628,9 @@ class Twarc(object):
                 log.info("hydrating %s ids", len(ids))
                 resp = self.post(url, data={
                     "id": ','.join(ids),
-                    "include_ext_alt_text": 'true'
+                    "include_ext_alt_text": 'true',
+                    "include_entities": 'true',
+                    "trim_user": trim_user
                 })
                 tweets = resp.json()
                 tweets.sort(key=lambda t: t['id_str'])
@@ -496,7 +643,9 @@ class Twarc(object):
             log.info("hydrating %s", ids)
             resp = self.post(url, data={
                 "id": ','.join(ids),
-                "include_ext_alt_text": 'true'
+                "include_ext_alt_text": 'true',
+                "include_entities": 'true',
+                "trim_user": trim_user
             })
             for tweet in resp.json():
                 yield tweet
@@ -507,18 +656,26 @@ class Twarc(object):
         except StopIteration:
             return []
 
-    def retweets(self, tweet_id):
+    def retweets(self, tweet_ids):
         """
-        Retrieves up to the last 100 retweets for the provided
-        tweet.
+        Retrieves up to the last 100 retweets for the provided iterator of tweet_ids.
         """
-        log.info("retrieving retweets of %s", tweet_id)
-        url = "https://api.twitter.com/1.1/statuses/retweets/""{}.json".format(
-                tweet_id)
+        if not isinstance(tweet_ids, types.GeneratorType):
+            tweet_ids = iter(tweet_ids)
 
-        resp = self.get(url, params={"count": 100})
-        for tweet in resp.json():
-            yield tweet
+        for tweet_id in tweet_ids:
+            if hasattr(tweet_id, 'strip'):
+                tweet_id = tweet_id.strip()
+            log.info("retrieving retweets of %s", tweet_id)
+            url = "https://api.twitter.com/1.1/statuses/retweets/""{}.json".format(
+                    tweet_id)
+            try:
+                resp = self.get(url, params={"count": 100}, allow_404=True)
+                for tweet in resp.json():
+                    yield tweet
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 404:
+                    log.info("can't get tweets for non-existent tweet: %s", tweet_id)
 
     def trends_available(self):
         """
@@ -656,7 +813,7 @@ class Twarc(object):
     def oembed(self, tweet_url, **params):
         """
         Returns the oEmbed JSON for a tweet. The JSON includes an html
-        key that contains the HTML for the embed. You can pass in 
+        key that contains the HTML for the embed. You can pass in
         parameters that correspond to the paramters that Twitter's
         statuses/oembed endpoint supports. For example:
 
@@ -678,10 +835,17 @@ class Twarc(object):
         if not self.client:
             self.connect()
 
-        if "params" in kwargs:
-            kwargs["params"]["tweet_mode"] = self.tweet_mode
-        else:
+        # set default tweet_mode
+        if "params" not in kwargs:
             kwargs["params"] = {"tweet_mode": self.tweet_mode}
+        else:
+            kwargs["params"]["tweet_mode"] = self.tweet_mode
+
+        # override tweet_mode for labs and premium endpoints
+        if re.search(r"api.twitter.com/labs", args[0]):
+            kwargs["params"] = {"format": "detailed"}
+        elif re.search(r"api.twitter.com/1.1/tweets/search/", args[0]):
+            kwargs["params"].pop("tweet_mode")
 
         # Pass allow 404 to not retry on 404
         allow_404 = kwargs.pop('allow_404', False)
@@ -741,6 +905,7 @@ class Twarc(object):
                 kwargs['connection_error_count'] = connection_error_count
                 return self.post(*args, **kwargs)
 
+    @catch_timeout
     def connect(self):
         """
         Sets up the HTTP session to talk to Twitter. If one is active it is
@@ -758,12 +923,24 @@ class Twarc(object):
             self.last_response.close()
         log.info("creating http session")
 
-        self.client = OAuth1Session(
-            client_key=self.consumer_key,
-            client_secret=self.consumer_secret,
-            resource_owner_key=self.access_token,
-            resource_owner_secret=self.access_token_secret
-        )
+        if not self.app_auth:
+            logging.info('creating OAuth1 user authentication')
+            self.client = OAuth1Session(
+                client_key=self.consumer_key,
+                client_secret=self.consumer_secret,
+                resource_owner_key=self.access_token,
+                resource_owner_secret=self.access_token_secret
+            )
+        else:
+            logging.info('creating OAuth2 app authentication')
+            client = BackendApplicationClient(client_id=self.consumer_key)
+            oauth = OAuth2Session(client=client)
+            token = oauth.fetch_token(
+                token_url='https://api.twitter.com/oauth2/token',
+                client_id=self.consumer_key,
+                client_secret=self.consumer_secret
+            )
+            self.client = oauth
 
     def get_keys(self):
         """
@@ -796,19 +973,26 @@ class Twarc(object):
         keys_present = self.consumer_key and self.consumer_secret and \
                        self.access_token and self.access_token_secret
 
+        if self.app_auth:
+            # no need to validate keys when using OAuth2 App Auth.
+            return True
+
         if keys_present:
             try:
                 # Need to explicitly reconnect to confirm the current creds
                 # are used in the session object.
                 self.connect()
                 self.get(url)
+                return True
             except requests.HTTPError as e:
                 if e.response.status_code == 401:
                     raise RuntimeError('Invalid credentials provided.')
                 else:
                     raise e
         else:
-            raise RuntimeError('Incomplete credentials provided.')
+            print('Incomplete credentials provided.')
+            print('Please run the command "twarc configure" to get started.')
+            sys.exit()
 
     def load_config(self):
         path = self.config
@@ -873,42 +1057,58 @@ class Twarc(object):
             self.consumer_key = get_input('consumer key: ')
             self.consumer_secret = get_input('consumer secret: ')
 
-        request_token_url = 'https://api.twitter.com/oauth/request_token'
-        oauth = OAuth1(self.consumer_key, client_secret=self.consumer_secret)
-        r = requests.post(url=request_token_url, auth=oauth)
+        answered = False
+        while not answered:
+            print("\nHow would you like twarc to obtain your user keys?\n\n1) generate access keys by visiting Twitter\n2) manually enter your access token and secret\n")
+            answer = get_input('Please enter your choice [1/2] ')
+            if answer == "1":
+                answered = True
+                generate = True
+            elif answer == "2":
+                answered = True
+                generate = False
 
-        credentials = parse_qs(r.text)
-        if not credentials:
-            print("\nError: invalid credentials.")
-            print("Please check that you are copying and pasting correctly and try again.\n")
-            return
+        if generate:
+            request_token_url = 'https://api.twitter.com/oauth/request_token'
+            oauth = OAuth1(self.consumer_key, client_secret=self.consumer_secret)
+            r = requests.post(url=request_token_url, auth=oauth)
 
-        resource_owner_key = credentials.get('oauth_token')[0]
-        resource_owner_secret = credentials.get('oauth_token_secret')[0]
+            credentials = parse_qs(r.text)
+            if not credentials:
+                print("\nError: invalid credentials.")
+                print("Please check that you are copying and pasting correctly and try again.\n")
+                return
 
-        base_authorization_url = 'https://api.twitter.com/oauth/authorize'
-        authorize_url = base_authorization_url + '?oauth_token=' + resource_owner_key
-        print('\nPlease log into Twitter and visit this URL in your browser:\n%s' % authorize_url)
-        verifier = get_input('\nAfter you have authorized the application please enter the displayed PIN: ')
+            resource_owner_key = credentials.get('oauth_token')[0]
+            resource_owner_secret = credentials.get('oauth_token_secret')[0]
 
-        access_token_url = 'https://api.twitter.com/oauth/access_token'
-        oauth = OAuth1(self.consumer_key,
-                       client_secret=self.consumer_secret,
-                       resource_owner_key=resource_owner_key,
-                       resource_owner_secret=resource_owner_secret,
-                       verifier=verifier)
-        r = requests.post(url=access_token_url, auth=oauth)
-        credentials = parse_qs(r.text)
+            base_authorization_url = 'https://api.twitter.com/oauth/authorize'
+            authorize_url = base_authorization_url + '?oauth_token=' + resource_owner_key
+            print('\nPlease log into Twitter and visit this URL in your browser:\n%s' % authorize_url)
+            verifier = get_input('\nAfter you have authorized the application please enter the displayed PIN: ')
 
-        if not credentials:
-            print('\nError: invalid PIN')
-            print('Please check that you entered the PIN correctly and try again.\n')
-            return
+            access_token_url = 'https://api.twitter.com/oauth/access_token'
+            oauth = OAuth1(self.consumer_key,
+                           client_secret=self.consumer_secret,
+                           resource_owner_key=resource_owner_key,
+                           resource_owner_secret=resource_owner_secret,
+                           verifier=verifier)
+            r = requests.post(url=access_token_url, auth=oauth)
+            credentials = parse_qs(r.text)
 
-        self.access_token = resource_owner_key = credentials.get('oauth_token')[0]
-        self.access_token_secret = credentials.get('oauth_token_secret')[0]
+            if not credentials:
+                print('\nError: invalid PIN')
+                print('Please check that you entered the PIN correctly and try again.\n')
+                return
 
-        screen_name = credentials.get('screen_name')[0]
+            self.access_token = resource_owner_key = credentials.get('oauth_token')[0]
+            self.access_token_secret = credentials.get('oauth_token_secret')[0]
+
+            screen_name = credentials.get('screen_name')[0]
+        else:
+            self.access_token = get_input("Enter your Access Token: ")
+            self.access_token_secret = get_input("Enter your Access Token Secret: ")
+            screen_name = "default"
 
         config = self.save_config(screen_name)
         print('\nThe credentials for %s have been saved to your configuration file at %s' % (screen_name, self.config))

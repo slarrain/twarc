@@ -2,8 +2,13 @@ import os
 import re
 import json
 import time
-import logging
+import dotenv
 import pytest
+import logging
+import datetime
+
+dotenv.load_dotenv()
+
 try:
     from unittest.mock import patch, call, MagicMock  # Python 3
 except ImportError:
@@ -13,6 +18,7 @@ from requests_oauthlib import OAuth1Session
 import requests
 
 import twarc
+from twarc import json2csv
 
 """
 
@@ -43,6 +49,12 @@ def test_search():
             break
     assert count == 10
 
+def test_search_max_pages():
+    count = 0
+    for tweet in T.search('obama', max_pages=3):
+        count += 1
+        assert tweet['id_str']
+    assert count == 300
 
 def test_search_max_pages():
     tweets = list(T.search('obama', max_pages=1))
@@ -104,7 +116,7 @@ def test_paging():
 
 def test_geocode():
     # look for tweets from New York ; the search radius is larger than NYC
-    # so hopefully we'll find one from New York in the first 100?
+    # so hopefully we'll find one from New York in the first 500?
     count = 0
     found = False
 
@@ -112,7 +124,7 @@ def test_geocode():
         if (tweet['place'] or {}).get('name') == 'Manhattan':
             found = True
             break
-        if count > 100:
+        if count > 500:
             break
         count += 1
 
@@ -147,7 +159,6 @@ def test_follow():
         "1020058453",  # @BuzzFeedNews
         "23484039",    # WSJbreakingnews
         "384438102",   # ABCNewsLive
-        "15108702",    # ReutersLive
         "87416722"     # SkyNewsBreak
     ]
     found = False
@@ -369,8 +380,7 @@ def test_user_lookup_by_user_id():
         '1020058453',  # @BuzzFeedNews
         '23484039',    # WSJbreakingnews
         '384438102',   # ABCNewsLive
-        '15108702',    # ReutersLive
-        '87416722'    # SkyNewsBreak
+        '87416722'     # SkyNewsBreak
     ]
 
     uids = []
@@ -385,7 +395,7 @@ def test_user_lookup_by_screen_name():
     # looks for the user with given screen_names
     screen_names = ["guardian", "nytimes", "cnnbrk", "BBCBreaking",
                     "washingtonpost", "BuzzFeedNews", "WSJbreakingnews",
-                    "ABCNewsLive", "ReutersLive", "SkyNewsBreak"]
+                    "ABCNewsLive", "SkyNewsBreak"]
 
     names = []
 
@@ -527,7 +537,13 @@ def test_http_error_filter():
 
 
 def test_retweets():
-    assert len(list(T.retweets('795972820413140992'))) == 2
+    # hopefully there will continue to be more than 100 retweets of these 
+    assert len(list(T.retweets(['20', '21']))) > 100
+
+
+def test_missing_retweets():
+    # this tweet doesn't exist and cannot have any retweets
+    assert len(list(T.retweets(['795972820413140991']))) == 0
 
 
 def test_oembed():
@@ -611,16 +627,94 @@ def test_extended_compat():
     assert 'full_text' in next(T.timeline(screen_name="BarackObama"))
     assert 'text' in next(t_compat.timeline(screen_name="BarackObama"))
 
+def test_csv_retweet():
+    for tweet in T.search('obama'):
+        if 'retweeted_status' in tweet:
+            break
+    text = json2csv.text(tweet)
+    assert not text.startswith('RT @')
+
+def test_truncated_text():
+    for tweet in T.filter('tweet'):
+        if tweet['truncated'] == True:
+            break
+    assert tweet['text'] != tweet['extended_tweet']['full_text']
+    assert json2csv.text(tweet) == tweet['extended_tweet']['full_text']
 
 def test_invalid_credentials():
     old_consumer_key = T.consumer_key
-    T.consumer_key = None
-
-    with pytest.raises(RuntimeError):
-        T.validate_keys()
 
     T.consumer_key = 'Definitely not a valid key'
     with pytest.raises(RuntimeError):
         T.validate_keys()
 
     T.consumer_key = old_consumer_key
+
+def test_app_auth():
+    ta = twarc.Twarc(app_auth=True)
+    count = 0
+    for tweet in ta.search('obama'):
+        assert tweet['id_str']
+        count += 1
+        if count == 10:
+            break
+    assert count == 10
+
+
+def test_labs_v1_sample():
+    ta = twarc.Twarc(app_auth=True)
+
+    collected = 0
+    for tweet in ta.labs_v1_sample():
+        if 'data' in tweet:
+            collected += 1
+        if collected == 100:
+            break
+
+    # reconnect to close streaming connection for other tests
+    ta.connect()
+
+@pytest.mark.skipif(os.environ.get('TWITTER_ENV') == None, reason="No environment")
+def test_premium_30day_search():
+    twitter_env = os.environ['TWITTER_ENV']
+    t = twarc.Twarc(app_auth=True)
+    now = datetime.date.today()
+    then = (now - datetime.timedelta(days=14))
+
+    search = t.premium_search(
+        q='blacklivesmatter',
+        product='30day',
+        environment=twitter_env,
+        to_date=then,
+        sandbox=True
+    )
+    tweet = next(search)
+    assert tweet
+
+@pytest.mark.skipif(os.environ.get('TWITTER_ENV') == None, reason="No environment")
+def test_premium_fullarchive_search():
+    twitter_env = os.environ['TWITTER_ENV']
+    from_date = datetime.date(2013, 7, 1)
+    to_date = datetime.date(2013, 8, 1)
+    t = twarc.Twarc(app_auth=True)
+    search = t.premium_search(
+        q='blacklivesmatter',
+        product='fullarchive',
+        environment=twitter_env,
+        from_date=from_date,
+        to_date=to_date,
+        sandbox=True
+    )
+
+    count = 0
+    for tweet in search:
+        created_at = datetime.datetime.strptime(
+            tweet['created_at'],
+            '%a %b %d %H:%M:%S +0000 %Y'
+        )
+        assert created_at.date() >= from_date
+        assert created_at.date() <= to_date
+        count += 1
+
+    assert count > 200
+
