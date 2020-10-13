@@ -10,4 +10,5 @@ twarc.egg-info
 .pytest_cache
 dev_env/
 dev_venv/
-.vscode/
+.vscode
+.env

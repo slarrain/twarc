@@ -14,6 +14,7 @@ import fileinput
 from twarc import __version__
 from twarc.client import Twarc
 from twarc.json2csv import csv, get_headings, get_row
+from dateutil.parser import parse as parse_dt
 
 if sys.version_info[:2] <= (2, 7):
     # Python 2
@@ -49,6 +50,7 @@ commands = [
     'users',
     'listmembers',
     'version',
+    'labs_v1_sample',
 ]
 
 
@@ -65,8 +67,11 @@ def main():
         format="%(asctime)s %(levelname)s %(message)s"
     )
 
-    # catch ctrl-c so users don't see a stack trace
-    signal.signal(signal.SIGINT, lambda signal, frame: sys.exit(0))
+    # log and stop when process receives SIGINT
+    def stop(signal, frame):
+        log.warn('process received SIGNT, stopping')
+        sys.exit(0)
+    signal.signal(signal.SIGINT, stop)
 
     if command == "version":
         print("twarc v%s" % __version__)
@@ -85,6 +90,9 @@ def main():
     else:
         validate_keys = True
 
+    # Force app_auth when using Labs or Premium API
+    if command == "lab_v1_sample" or args.thirtyday or args.fullarchive:
+        args.app_auth = True
 
     t = Twarc(
         consumer_key=args.consumer_key,
@@ -98,6 +106,7 @@ def main():
         tweet_mode=args.tweet_mode,
         protected=args.protected,
         validate_keys=validate_keys,
+        app_auth=args.app_auth
     )
 
     # calls that return tweets
@@ -106,14 +115,36 @@ def main():
             lang = args.lang[0]
         else:
             lang=None
-        things = t.search(
-            query,
-            since_id=args.since_id,
-            max_id=args.max_id,
-            lang=lang,
-            result_type=args.result_type,
-            geocode=args.geocode
-        )
+
+        # if not using a premium endpoint do a standard search
+        if not args.thirtyday and not args.fullarchive:
+            things = t.search(
+                query,
+                since_id=args.since_id,
+                max_id=args.max_id,
+                lang=lang,
+                result_type=args.result_type,
+                geocode=args.geocode
+            )
+        else:
+            # parse the dates if given
+            from_date = parse_dt(args.from_date) if args.from_date else None
+            to_date = parse_dt(args.to_date) if args.to_date else None
+            if args.thirtyday:
+                env = args.thirtyday
+                product = '30day'
+            else:
+                env = args.fullarchive
+                product = 'fullarchive'
+            things = t.premium_search(
+                query,
+                product,
+                env,
+                from_date=from_date,
+                to_date=to_date,
+                sandbox=args.sandbox,
+                limit=args.limit,
+            )
 
     elif command == "filter":
         things = t.filter(
@@ -145,6 +176,9 @@ def main():
     elif command == "sample":
         things = t.sample()
 
+    elif command == "labs_v1_sample":
+        things = t.labs_v1_sample()
+
     elif command == "timeline":
         kwargs = {"max_id": args.max_id, "since_id": args.since_id}
         if re.match('^[0-9]+$', query):
@@ -154,7 +188,15 @@ def main():
         things = t.timeline(**kwargs)
 
     elif command == "retweets":
-        things = t.retweets(query)
+        if os.path.isfile(query):
+            iterator = fileinput.FileInput(
+                query,
+                mode='r',
+                openhook=fileinput.hook_compressed,
+            )
+            things = t.retweets(tweet_ids=iterator)
+        else:
+            things = t.retweets(tweet_ids=query.split(','))
 
     elif command == "users":
         if os.path.isfile(query):
@@ -291,6 +333,9 @@ def main():
             log.warning(thing['warning']['message'])
             if args.warnings:
                 print(json.dumps(thing), file=fh)
+        elif 'data' in thing:
+            # Labs style JSON schema.
+            print(json.dumps(thing), file=fh)
 
 
 def get_argparser():
@@ -352,6 +397,20 @@ def get_argparser():
                         help="used with --output to split into numbered files")
     parser.add_argument("--skip_key_validation", action="store_true",
                         help="skip checking keys are valid on startup")
+    parser.add_argument("--app_auth", action="store_true", default=False,
+                        help="run in App Auth mode instead of User Auth")
+    parser.add_argument("--30day", action="store", dest="thirtyday", 
+                        help="environment to use to search 30day premium endpoint")
+    parser.add_argument("--fullarchive", action="store",
+                        help="environment to use to search fullarchive premium endpoint"),
+    parser.add_argument("--from_date", action="store", default=None,
+                        help="limit premium search to date e.g. 2012-05-01 03:04:01")
+    parser.add_argument("--to_date", action="store", default=None,
+                        help="limit premium search to date e.g. 2012-05-01 03:04:01")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="limit number of tweets returned by Premium API")
+    parser.add_argument("--sandbox", action="store_true", default=False,
+                        help="indicate that Premium API endpoint is a sandbox")
 
     return parser
 

@@ -61,7 +61,7 @@ def main():
 	<head>
 	<meta charset="utf-8">
 	<title>twarc wordcloud</title>
-	<script src="http://d3js.org/d3.v3.min.js"></script>
+	<script src="https://d3js.org/d3.v3.min.js"></script>
 	</head>
 	<body>
 	<script>
@@ -105,10 +105,12 @@ def main():
 
 	sys.stdout.write(output)
 
+
 def text(t):
     if 'full_text' in t:
         return t['full_text']
     return t['text']
+
 
 if __name__ == "__main__":
     main()
